@@ -4,13 +4,19 @@
 // خروجی همه توابع یک آبجکت است:
 //   { message, projects?, keyboard?, removeKeyboard? }
 // - message: متنی که به کاربر نشان داده می‌شود
-// - projects: لیست پروژه‌ها (برای ویجت وب و دکمه‌های تلگرام)
+// - projects: لیست پروژه‌ها (برای ویجت وب)
 // - keyboard / removeKeyboard: راهنمای لایه تلگرام برای ساخت کیبورد
 //
 // وضعیت‌های نشست:
-//   choosing_project → کاربر هنوز پروژه را انتخاب نکرده
-//   chatting         → در حال جمع‌آوری اطلاعات
+//   awaiting_contact → (فقط تلگرام) هنوز شماره از طریق دکمه اشتراک مخاطب گرفته نشده
+//   choosing_project → کاربر هنوز اسم پروژه را نگفته
+//   chatting         → در حال جمع‌آوری اطلاعات فایل
 //   followup         → قیمت اعلام و لید ثبت شده، اما کاربر می‌تواند اصلاحیه بدهد
+//
+// تغییرات کلیدی نسبت به نسخه قبل:
+// ۱) دیگر لیست پروژه‌ها به کاربر نشان داده نمی‌شود؛ مستقیم از او خواسته می‌شود اسم پروژه را بنویسد.
+// ۲) نام و شماره تماس دیگر توسط AI پرسیده نمی‌شود؛ این دو یا از قبل (مثلاً دکمه اشتراک مخاطب
+//    تلگرام) روی session.contact ست شده‌اند، یا (در وب) از فرم لندینگ‌پیج می‌آیند.
 
 import { getActiveProjects, findProject, addLead, updateLead } from "./sheets.js";
 import { startConversation, sendTurn, AiError } from "./ai.js";
@@ -29,20 +35,17 @@ const RETRY_SAVED_MESSAGE = "✅ اطلاعاتتون با موفقیت ثبت �
 const FOLLOWUP_HINT =
   "\n\nاگه می‌خواید اطلاعات رو اصلاح کنید همین‌جا بنویسید، و برای ثبت فایل جدید «شروع مجدد» را بفرستید.";
 
-function projectListText(projects) {
-  return projects.map((p, i) => `${i + 1}. ${p.name}`).join("\n");
-}
+const ASK_PROJECT_NAME_MESSAGE =
+  "سلام 🌷 به پیش‌هوش، دستیار هوشمند دفتر املاک دیار خوش اومدید!\n\nلطفاً اسم پروژه‌ای که می‌خواید براش استعلام قیمت بگیرید رو بنویسید:";
 
-function welcomeText(projects) {
-  return `سلام و وقت بخیر 🌷 به ربات دفتر املاک دیار خوش اومدید!\n\nبرای ثبت اطلاعات فایلتون، شماره یا اسم پروژه رو بفرستید:\n\n${projectListText(
-    projects
-  )}`;
+function welcomeText() {
+  return ASK_PROJECT_NAME_MESSAGE;
 }
 
 export async function getWelcomeMessage() {
   const projects = await getActiveProjects();
   if (!projects.length) return { message: NO_PROJECT_MESSAGE, projects: [] };
-  return { message: welcomeText(projects), projects };
+  return { message: welcomeText(), projects };
 }
 
 // صورت‌جلسهٔ مکالمه برای ارسال به مدیر وقتی ثبت لید شکست می‌خورد
@@ -54,7 +57,6 @@ function transcriptFromSession(session) {
         const text = (item.parts ?? []).map((p) => p?.text ?? "").join(" ");
         const clean = text.replace(/\s+/g, " ").trim();
         if (!clean) return "";
-        // اگر خروجی ساخت‌یافته بود، فقط بخش reply را نگه دار
         try {
           const parsed = JSON.parse(clean);
           if (parsed?.reply) return `${item.role === "user" ? "کاربر" : "ربات"}: ${parsed.reply}`;
@@ -71,9 +73,10 @@ function transcriptFromSession(session) {
 }
 
 async function saveLead(session, lead, source) {
+  const contact = session.contact || {};
   const data = {
-    customerName: lead?.customerName || "",
-    phone: lead?.phone || "",
+    customerName: contact.customerName || "",
+    phone: contact.phone || "",
     projectName: session.project?.name || "",
     fileInfo: lead?.fileInfo || "",
     estimatedPrice: lead?.estimatedPrice ?? "",
@@ -125,11 +128,7 @@ async function chooseProject(text, session) {
   const project = await findProject(text);
   if (!project) {
     return {
-      message: `متاسفانه «${chunkText(text, 80)[0]}» رو بین پروژه‌ها پیدا نکردم 🙏\n\nمی‌تونید شمارهٔ پروژه یا اسم کاملش رو بفرستید:\n\n${projectListText(
-        projects
-      )}`,
-      projects,
-      keyboard: projects.map((p) => p.name),
+      message: `متاسفانه «${chunkText(text, 80)[0]}» رو پیدا نکردم 🙏\nلطفاً اسم دقیق پروژه رو بنویسید.`,
     };
   }
 
@@ -143,16 +142,10 @@ async function chooseProject(text, session) {
     if (project.warnings?.length) console.warn(`⚠️ پروژه «${project.name}» با هشدار بارگذاری شد: ${project.warnings.join("؛ ")}`);
     return { message: greeting, removeKeyboard: true };
   } catch (err) {
-    // معمولاً یعنی ستون «فیلدهای موردنیاز» برای این پروژه خالی است
     const userMessage = err instanceof AiError ? err.userMessage : "برای این پروژه خطایی پیش اومد. لطفاً پروژهٔ دیگری را انتخاب کنید.";
     console.error(`❌ شروع مکالمه برای پروژه «${project.name}» ناموفق بود:`, err.message);
     notifyAdmin(`🚨 پروژه «${project.name}» قابل شروع نیست: ${err.message}`);
-    const others = projects.filter((p) => p.name !== project.name);
-    return {
-      message: `${userMessage}\n\n${others.length ? `پروژه‌های در دسترس:\n${projectListText(others)}` : ""}`,
-      projects: others,
-      keyboard: others.map((p) => p.name),
-    };
+    return { message: `${userMessage}\n\nلطفاً اسم پروژه دیگری رو بنویسید.` };
   }
 }
 
@@ -169,14 +162,12 @@ async function continueChat(session, text, source) {
   const saved = await saveLead(session, turn.lead, source);
   session.state = "followup";
   if (!saved.ok) {
-    // عمداً وضعیت را followup نگه می‌داریم تا کاربر بتواند «ثبت مجدد» بفرستد
     return { message: `${turn.reply}\n\n${saved.notice}` };
   }
   return { message: `${turn.reply}\n\n${saved.notice}${FOLLOWUP_HINT}` };
 }
 
 async function handleFollowup(session, text, source) {
-  // اگر نشست پاک شده باشد (مثلاً بعد از عمر ۲ ساعته)، کاربر را به اول مسیر برمی‌گردانیم
   if (!session.chat) {
     session.state = "choosing_project";
     return chooseProject(text, session);
@@ -189,20 +180,18 @@ async function handleFollowup(session, text, source) {
 
   const turn = await sendTurn(session.chat, text);
 
-  // اگر کاربر نام یا شماره‌اش را اصلاح کرد، همان ردیف شیت به‌روز می‌شود (نه یک ردیف تکراری)
   if (turn.lead && session.leadRowNumber && session.savedLead) {
-    const nameChanged = turn.lead.customerName && turn.lead.customerName !== session.savedLead.customerName;
-    const phoneChanged = turn.lead.phone && turn.lead.phone.replace(/\D/g, "") !== session.savedLead.phone.replace(/\D/g, "");
-    if (nameChanged || phoneChanged) {
-      const patch = { ...session.savedLead, ...turn.lead, projectName: session.project?.name, source };
+    const patch = { ...session.savedLead, fileInfo: turn.lead.fileInfo, estimatedPrice: turn.lead.estimatedPrice, projectName: session.project?.name, source };
+    const infoChanged = turn.lead.fileInfo && turn.lead.fileInfo !== session.savedLead.fileInfo;
+    if (infoChanged) {
       try {
         await updateLead(session.leadRowNumber, patch);
         session.savedLead = patch;
-        console.log(`✏️ لید ردیف ${session.leadRowNumber} اصلاح شد (نام/شماره).`);
+        console.log(`✏️ لید ردیف ${session.leadRowNumber} اصلاح شد.`);
         return { message: `${turn.reply}\n\n✅ اطلاعات پرونده‌تون به‌روز شد.` };
       } catch (err) {
         console.error("❌ به‌روزرسانی لید ناموفق بود:", err.message);
-        notifyAdmin(`🚨 اصلاح لید ردیف ${session.leadRowNumber} ناموفق بود: ${err.message}\nنام: ${patch.customerName}\nتماس: ${patch.phone}`);
+        notifyAdmin(`🚨 اصلاح لید ردیف ${session.leadRowNumber} ناموفق بود: ${err.message}`);
         return { message: `${turn.reply}\n\n⚠️ اصلاح اطلاعات ثبت نشد؛ لطفاً با دفتر تماس بگیرید.` };
       }
     }
@@ -213,15 +202,19 @@ async function handleFollowup(session, text, source) {
 
 // پردازش یک پیام کاربر
 // key: شناسه یکتا (مثل "telegram:123" یا "web:abc") | text: متن کاربر | source: "تلگرام" یا "لندینگ‌پیج"
-export function handleUserMessage(key, text, source) {
+// contact: (اختیاری) { customerName, phone } - وقتی این اطلاعات از قبل جمع‌آوری شده (مثلاً از دکمه تلگرام)
+export function handleUserMessage(key, text, source, contact) {
   return withSessionLock(key, async () => {
     const session = getSession(key);
+    if (contact && (contact.customerName || contact.phone)) {
+      session.contact = { ...session.contact, ...contact };
+    }
     const clean = String(text ?? "").trim();
 
     if (!clean) return { message: "لطفاً پیام‌تون رو بنویسید تا راهنمایی‌تون کنم." };
     if (clean.length > 4000) return { message: "پیام‌تون خیلی بلند بود 🙏 لطفاً کوتاه‌تر و خلاصه‌تر بنویسید." };
 
-    if (isRestartCommand(clean)) return await startOver(key);
+    if (isRestartCommand(clean)) return await startOver(key, session.contact);
 
     try {
       if (session.state === "choosing_project") return await chooseProject(clean, session);
@@ -230,7 +223,6 @@ export function handleUserMessage(key, text, source) {
     } catch (err) {
       console.error(`❌ [${key}] خطا در پردازش پیام:`, err.message || err);
       const userMessage = err instanceof AiError ? err.userMessage : "متاسفانه خطایی پیش اومد 🙏 لطفاً دوباره امتحان کنید.";
-      // اگر نشست خراب شده (chat ندارد) کاربر را به اول مسیر برمی‌گردانیم
       if (!session.chat) {
         session.state = "choosing_project";
         return { message: `${userMessage}\n\n«شروع مجدد» را بفرستید تا از اول شروع کنیم.` };
@@ -240,9 +232,14 @@ export function handleUserMessage(key, text, source) {
   });
 }
 
-export async function startOver(key) {
+// contact: (اختیاری) { customerName, phone } برای حفظ اطلاعات تماس بعد از شروع مجدد
+export async function startOver(key, contact) {
   resetSession(key);
-  getSession(key);
+  const session = getSession(key);
+  if (contact && (contact.customerName || contact.phone)) {
+    session.contact = { ...contact };
+  }
+  session.state = "choosing_project";
   const welcome = await getWelcomeMessage();
-  return { ...welcome, keyboard: welcome.projects?.map((p) => p.name) ?? null, removeKeyboard: false };
+  return { ...welcome, removeKeyboard: true };
 }
